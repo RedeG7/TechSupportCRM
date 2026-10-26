@@ -1,0 +1,132 @@
+name: Build e Deploy
+
+# Mesmo modelo do honorariocontrol e do conciliacao-bancaria: a imagem é
+# montada aqui e publicada no GHCR; o VPS só recebe o docker-compose e faz
+# pull + up em /opt/techsupport.
+on:
+  push:
+    branches: [main, claude/nifty-noether-51epxh]
+    paths-ignore:
+      - "**.md"
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-vps
+  cancel-in-progress: false
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/redeg7/techsupportcrm:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    # o token do job é repassado ao VPS só para baixar a imagem do GHCR
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+
+      # Chave SSH: tolera a chave colada com linhas grudadas, espaços ou
+      # CRLF, e também em base64 numa linha (base64 -w0 ~/.ssh/chave).
+      - name: Preparar chave SSH
+        env:
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          bash .github/scripts/normalize-ssh-key.sh > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keygen -y -f ~/.ssh/deploy_key > /dev/null \
+            || { echo "::error::VPS_SSH_KEY está incompleta ou corrompida. Cole de novo a chave inteira."; exit 1; }
+          ssh-keyscan -p 22 -H "$VPS_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+
+      # só os arquivos de deploy: o código da app vem pela imagem
+      - name: Copiar arquivos de deploy para o VPS
+        env:
+          TARGET: ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}
+        run: |
+          tar czf - docker-compose.yml deploy/compose.proxy-hub.yml \
+            | ssh -i ~/.ssh/deploy_key "$TARGET" "mkdir -p /opt/techsupport && tar xzf - -C /opt/techsupport"
+
+      # Configurações opcionais guardadas como secrets do GitHub vão para o
+      # .env do VPS (só as que existem; as demais linhas do .env ficam intactas)
+      - name: Sincronizar configurações (secrets → .env)
+        env:
+          TARGET: ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}
+          APP_URL: ${{ secrets.APP_URL }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          EMAIL_SERVICE: ${{ secrets.EMAIL_SERVICE }}
+          EMAIL_USER: ${{ secrets.EMAIL_USER }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+        run: |
+          umask 077; : > sync.env
+          for k in APP_URL ANTHROPIC_API_KEY EMAIL_SERVICE EMAIL_USER EMAIL_PASSWORD EMAIL_FROM; do
+            v="$(printf '%s' "${!k}" | tr -d '\r\n')"
+            if [ -n "$v" ]; then printf '%s=%s\n' "$k" "$v" >> sync.env; echo "sincronizando $k"; fi
+          done
+          if [ ! -s sync.env ]; then echo "nenhuma configuração extra cadastrada"; rm -f sync.env; exit 0; fi
+          ssh -i ~/.ssh/deploy_key "$TARGET" 'umask 077; cat > /tmp/techsupport-sync.env' < sync.env
+          rm -f sync.env
+          ssh -i ~/.ssh/deploy_key "$TARGET" 'cd /opt/techsupport && touch .env && while IFS= read -r line; do k="${line%%=*}"; grep -v "^${k}=" .env > .env.tmp || true; printf "%s\n" "$line" >> .env.tmp; mv .env.tmp .env; done < /tmp/techsupport-sync.env; rm -f /tmp/techsupport-sync.env; chmod 600 .env'
+
+      - name: Atualizar e reiniciar o app no VPS
+        env:
+          TARGET: ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ssh -i ~/.ssh/deploy_key "$TARGET" \
+            "GHCR_USER='$GHCR_USER' GHCR_TOKEN='$GHCR_TOKEN' bash -se" <<'REMOTE'
+          set -e
+          cd /opt/techsupport
+          touch .env && chmod 600 .env
+          # Primeiro deploy: senhas aleatórias geradas uma vez e guardadas no .env
+          gera() { grep -q "^$1=." .env || { sed -i "/^$1=/d" .env; printf '%s=%s\n' "$1" "$(openssl rand -hex 32)" >> .env; echo "$1 gerado"; }; }
+          gera POSTGRES_PASSWORD
+          gera SESSION_SECRET
+          grep -q '^APP_URL=' .env || echo 'APP_URL=https://suporte.redeg7.com' >> .env
+          grep -q '^APP_PORT=' .env || echo 'APP_PORT=5002' >> .env
+          # VPS compartilhada com o Hub: o app entra na rede do Caddy do
+          # conciliacao-bancaria (alias techsupport-app) - só liga no .env
+          # quando essa rede existe.
+          if docker network inspect conciliacao-bancaria_default >/dev/null 2>&1 \
+             && ! grep -q '^COMPOSE_FILE=' .env; then
+            printf 'COMPOSE_FILE=docker-compose.yml:deploy/compose.proxy-hub.yml\n' >> .env
+          fi
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+          docker compose pull app
+          docker compose up -d
+          docker image prune -f
+          docker logout ghcr.io
+          PORT="$(grep -E '^APP_PORT=' .env | cut -d= -f2)"; PORT="${PORT:-5002}"
+          for i in $(seq 1 40); do
+            curl -fs -o /dev/null "http://127.0.0.1:${PORT}/" && { echo "App no ar"; exit 0; }
+            sleep 3
+          done
+          docker compose logs --tail 80 app
+          echo "App não respondeu após o deploy"; exit 1
+          REMOTE

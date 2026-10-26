@@ -1,0 +1,14 @@
+node_modules
+dist
+.git
+.env
+.env.*
+uploads
+whatsapp-auth
+whatsapp-session
+.wwebjs_auth
+.wwebjs_cache
+*.log
+*.dump
+*.sql
+*.tar.gz

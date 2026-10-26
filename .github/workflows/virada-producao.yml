@@ -1,0 +1,91 @@
+# Virada do Replit para o VPS (executar manualmente, quantas vezes precisar):
+# restaura /opt/techsupport/backup.dump (e arquivos.tar.gz, se houver) no
+# banco do VPS. Antes de apagar o banco atual, valida o backup novo e guarda
+# uma cópia do banco atual.
+name: Virada para produção
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmar:
+        description: 'Digite VIRADA para confirmar'
+        required: true
+
+concurrency:
+  group: deploy-vps
+  cancel-in-progress: false
+
+jobs:
+  virada:
+    if: ${{ inputs.confirmar == 'VIRADA' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Preparar chave SSH
+        env:
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          bash .github/scripts/normalize-ssh-key.sh > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -p 22 -H "$VPS_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Executar a virada no VPS
+        env:
+          TARGET: ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}
+        run: |
+          # o script vai para um arquivo e roda de lá: se fosse lido pelo
+          # stdin, o "docker compose exec" consumiria o resto dele
+          ssh -i ~/.ssh/deploy_key "$TARGET" 'cat > /tmp/virada-techsupport.sh' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/techsupport
+          db() { docker compose exec -T db "$@"; }
+          q() { db psql -U techsupport -d techsupport -tAc "$1" 2>/dev/null || echo "-"; }
+
+          echo "== 1. Conferindo o backup novo"
+          test -s backup.dump || { echo "ERRO: /opt/techsupport/backup.dump não encontrado"; exit 1; }
+          ls -l --time-style=+'%d/%m/%Y %H:%M' backup.dump arquivos.tar.gz 2>/dev/null || true
+          db pg_restore -l < backup.dump > /dev/null \
+            || { echo "ERRO: backup.dump inválido ou corrompido - nada foi alterado"; exit 1; }
+          echo "backup.dump válido"
+
+          echo "== 2. Cópia de segurança do banco atual"
+          SEG="backup-antes-virada-$(date +%Y%m%d-%H%M).dump"
+          db pg_dump -U techsupport -Fc techsupport > "$SEG"
+          ls -l "$SEG"
+          echo "Antes: clientes=$(q 'select count(*) from clients') chamados=$(q 'select count(*) from tickets')"
+
+          echo "== 3. Restaurando o backup novo"
+          docker compose stop app
+          db dropdb -U techsupport techsupport
+          db createdb -U techsupport techsupport
+          db pg_restore -U techsupport -d techsupport --no-owner --no-acl < backup.dump \
+            || echo "(pg_restore terminou com avisos - normal para extensões/permissões do Replit)"
+          echo "Depois: clientes=$(q 'select count(*) from clients') chamados=$(q 'select count(*) from tickets') usuários=$(q 'select count(*) from users')"
+
+          echo "== 4. Subindo o sistema"
+          docker compose up -d app
+
+          echo "== 5. Arquivos enviados (anexos, logos)"
+          if [ -s arquivos.tar.gz ]; then
+            rm -rf /tmp/arq && mkdir /tmp/arq && tar xzf arquivos.tar.gz -C /tmp/arq
+            [ -d /tmp/arq/uploads ] && docker compose cp /tmp/arq/uploads/. app:/app/uploads/
+            rm -rf /tmp/arq
+            echo "arquivos restaurados"
+          else
+            echo "arquivos.tar.gz não encontrado - pulando"
+          fi
+
+          echo "== 6. Conferindo"
+          PORT="$(grep -E '^APP_PORT=' .env | cut -d= -f2)"; PORT="${PORT:-5002}"
+          for i in $(seq 1 40); do
+            curl -fs -o /dev/null "http://127.0.0.1:${PORT}/" && break
+            sleep 3
+          done
+          curl -fs -o /dev/null "http://127.0.0.1:${PORT}/" && echo "App respondendo" || { docker compose logs --tail 80 app; echo "ERRO: app não respondeu"; exit 1; }
+          echo "VIRADA CONCLUÍDA - cópia do banco anterior em /opt/techsupport/$SEG"
+          REMOTE
+          ssh -i ~/.ssh/deploy_key "$TARGET" 'bash /tmp/virada-techsupport.sh < /dev/null; rc=$?; rm -f /tmp/virada-techsupport.sh; exit $rc'

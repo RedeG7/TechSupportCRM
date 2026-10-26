@@ -1,0 +1,47 @@
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: techsupport
+      POSTGRES_USER: techsupport
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?defina POSTGRES_PASSWORD no .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      default:
+        aliases: [techsupport-db]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U techsupport -d techsupport"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    # Imagem publicada pelo GitHub Actions (.github/workflows/deploy-vps.yml);
+    # "build" permite montar localmente (docker compose build).
+    image: ghcr.io/redeg7/techsupportcrm:latest
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # "techsupport-db" e não "db": na rede do Caddy do Hub
+      # (deploy/compose.proxy-hub.yml) o nome "db" é o banco do conciliacao-bancaria
+      DATABASE_URL: postgres://techsupport:${POSTGRES_PASSWORD}@techsupport-db:5432/techsupport
+      NODE_ENV: production
+    depends_on:
+      db:
+        condition: service_healthy
+    # Só acessível pelo próprio servidor; o Caddy do Hub encaminha o domínio
+    ports:
+      - "127.0.0.1:${APP_PORT:-5002}:5000"
+    volumes:
+      - uploads:/app/uploads
+      - whatsapp_auth:/app/whatsapp-auth
+      - whatsapp_session:/app/whatsapp-session
+
+volumes:
+  pgdata:
+  uploads:
+  whatsapp_auth:
+  whatsapp_session:
