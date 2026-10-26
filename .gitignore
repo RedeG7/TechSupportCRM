@@ -1,0 +1,21 @@
+node_modules
+dist
+.DS_Store
+server/public
+vite.config.ts.*
+*.tar.gz
+# Private runtime data and backups
+.env
+.env.*
+!.env.example
+*.dump
+*.sql
+*.log
+cookie.txt
+whatsapp-session/
+.wwebjs_auth/
+.wwebjs_cache/
+uploads/
+.agents/
+.local/
+attached_assets/screenshots/
